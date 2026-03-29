@@ -555,20 +555,34 @@ def cli(ctx: click.Context) -> None:
 @click.argument(
     "shell",
     type=click.Choice(["bash", "zsh", "fish"], case_sensitive=False),
-    default="zsh",
+    default=None,
     required=False,
 )
-def cmd_completion(shell: str) -> None:
+def cmd_completion(shell: Optional[str]) -> None:
     """
     Print shell tab-completion setup instructions.
 
-    SHELL defaults to zsh. Supported: bash, zsh, fish.
+    SHELL is auto-detected from $SHELL if not specified.
+    Supported: bash, zsh, fish.
 
     \b
     Quick setup:
-      eval "$(hfw completion zsh)"   # add to ~/.zshrc
-      eval "$(hfw completion bash)"  # add to ~/.bashrc
+      eval "$(hfw completion)"       # auto-detect shell
+      eval "$(hfw completion zsh)"   # explicit shell
+      eval "$(hfw completion bash)"
     """
+    if shell is None:
+        shell_env = os.environ.get("SHELL", "")
+        shell_name = os.path.basename(shell_env).lower()
+        if shell_name in ("bash", "zsh", "fish"):
+            shell = shell_name
+        else:
+            err.print(
+                f"[yellow]Could not detect shell from $SHELL ('{shell_env}'). "
+                "Pass it explicitly: hfw completion [bash|zsh|fish][/yellow]"
+            )
+            sys.exit(1)
+
     shell = shell.lower()
     prog = "hfw"  # use the non-shadowing alias
     env_var = f"_{prog.upper()}_COMPLETE"
