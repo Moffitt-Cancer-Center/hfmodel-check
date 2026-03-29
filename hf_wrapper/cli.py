@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import os
+from pathlib import Path
 from typing import List, Optional
 
 import click
@@ -153,11 +154,28 @@ def cmd_hardware() -> None:
     default=None,
     help="Filter by pipeline tag (e.g. text-generation, fill-mask).",
 )
-def cmd_search(query: str, limit: int, show_all: bool, task: Optional[str]) -> None:
+@click.option(
+    "--download",
+    "download_index",
+    default=None,
+    type=int,
+    metavar="N",
+    help="Download result number N without interactive prompt (1-based).",
+)
+def cmd_search(
+    query: str,
+    limit: int,
+    show_all: bool,
+    task: Optional[str],
+    download_index: Optional[int],
+) -> None:
     """
     Search HuggingFace Hub for QUERY, showing only models compatible with
     your hardware.  Models that need quantization to fit are marked with the
     recommended quant level.
+
+    After results are shown you will be prompted to download a model by
+    entering its result number.  Pass --download N to skip the prompt.
     """
     from huggingface_hub import HfApi
 
@@ -207,13 +225,15 @@ def cmd_search(query: str, limit: int, show_all: bool, task: Optional[str]) -> N
         show_lines=False,
         padding=(0, 1),
     )
-    table.add_column("Model", style="cyan", no_wrap=True, min_width=30)
-    table.add_column("Params", justify="right", min_width=7)
+    table.add_column("#",      justify="right",  min_width=3, style="dim")
+    table.add_column("Model",  style="cyan",     no_wrap=True, min_width=30)
+    table.add_column("Params", justify="right",  min_width=7)
     table.add_column("Dtype",  justify="center", min_width=6)
     table.add_column("Status / Recommendation", min_width=28)
     table.add_column("Downloads", justify="right", min_width=10)
 
-    shown = 0
+    shown_models: List[str] = []   # repo_ids in display order (1-based index)
+
     for info in models:
         mem = estimate_from_listing(info)
         fits = mem.fits_in(available_mb)
@@ -221,7 +241,10 @@ def cmd_search(query: str, limit: int, show_all: bool, task: Optional[str]) -> N
         size_known = mem.param_count is not None
 
         if not show_all and not fits and not can_quant and size_known:
-            continue  # skip models that can't fit at all
+            continue
+
+        shown_models.append(info.id or "")
+        idx = len(shown_models)
 
         status_text, status_style = _status_cell(mem, available_mb)
 
@@ -229,15 +252,15 @@ def cmd_search(query: str, limit: int, show_all: bool, task: Optional[str]) -> N
         dl_str = f"{downloads:,}" if downloads else "—"
 
         table.add_row(
+            str(idx),
             info.id or "—",
             mem.param_str,
             mem.dtype,
             Text(status_text, style=status_style),
             Text(dl_str, style="dim"),
         )
-        shown += 1
 
-    if shown == 0:
+    if not shown_models:
         out.print(
             "[yellow]No compatible models found. "
             "Try --show-all to see all results.[/yellow]"
@@ -246,16 +269,68 @@ def cmd_search(query: str, limit: int, show_all: bool, task: Optional[str]) -> N
 
     out.print(table)
     out.print(
-        f"\n[dim]Showed {shown}/{len(models)} models. "
+        f"\n[dim]Showed {len(shown_models)}/{len(models)} models. "
         f"Green = fits natively, Yellow = fits with quantization, "
         f"Red = too large even with Q2.[/dim]"
     )
     if not show_all:
-        hidden = len(models) - shown
+        hidden = len(models) - len(shown_models)
         if hidden:
             out.print(
-                f"[dim]{hidden} model(s) hidden (too large). Use --show-all to see them.[/dim]"
+                f"[dim]{hidden} model(s) hidden (too large). "
+                f"Use --show-all to see them.[/dim]"
             )
+
+    # ------------------------------------------------------------------
+    # Download prompt
+    # ------------------------------------------------------------------
+    chosen_id: Optional[str] = None
+
+    if download_index is not None:
+        # Non-interactive: --download N flag
+        if 1 <= download_index <= len(shown_models):
+            chosen_id = shown_models[download_index - 1]
+        else:
+            err.print(
+                f"[red]--download {download_index} is out of range "
+                f"(1–{len(shown_models)}).[/red]"
+            )
+            sys.exit(1)
+    elif sys.stdin.isatty():
+        # Interactive prompt
+        try:
+            raw = input(
+                f"\nDownload a model? Enter number (1–{len(shown_models)}) "
+                "or press Enter to skip: "
+            ).strip()
+            if raw:
+                n = int(raw)
+                if 1 <= n <= len(shown_models):
+                    chosen_id = shown_models[n - 1]
+                else:
+                    err.print(
+                        f"[red]{n} is out of range (1–{len(shown_models)}).[/red]"
+                    )
+                    sys.exit(1)
+        except ValueError:
+            err.print("[red]Invalid input — expected a number.[/red]")
+            sys.exit(1)
+        except (EOFError, KeyboardInterrupt):
+            out.print("\n[dim]Download skipped.[/dim]")
+            return
+
+    if chosen_id:
+        download_root = _get_download_root()
+        local_dir = download_root / chosen_id
+        _run_download_with_check(chosen_id, ["--local-dir", str(local_dir)])
+
+
+def _get_download_root() -> Path:
+    """Return the model download root directory."""
+    shared_root = os.environ.get("AI_FLUX_SHARED_ROOT")
+    if shared_root:
+        return Path(shared_root) / "models"
+    return Path("/share/hpc_shared/models")
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +346,24 @@ def cmd_search(query: str, limit: int, show_all: bool, task: Optional[str]) -> N
 def cmd_download(repo_id: str, extra_args: tuple) -> None:
     """
     Download a repo (wraps `hf download`), with a hardware compatibility check.
+    Downloads to $AI_FLUX_SHARED_ROOT/models/<repo> or /share/hpc_shared/models/<repo>
+    unless --local-dir is passed explicitly.
     """
+    # If caller passed --local-dir themselves, respect it and skip our routing
+    extra = list(extra_args)
+    if "--local-dir" in extra:
+        # Let _download_model handle the check and forward; but use provided path
+        _run_download_with_check(repo_id, extra)
+        return
+
+    # Use shared model root, then forward extra args on top
+    download_root = _get_download_root()
+    local_dir = download_root / repo_id
+    _run_download_with_check(repo_id, ["--local-dir", str(local_dir)] + extra)
+
+
+def _run_download_with_check(repo_id: str, extra_args: List[str]) -> None:
+    """Hardware-check then forward to hub download with the given extra args."""
     hw = get_hw()
     available_mb = hw.effective_memory_mb
 
@@ -279,6 +371,12 @@ def cmd_download(repo_id: str, extra_args: tuple) -> None:
         f"\n[bold cyan]Hardware[/bold cyan]: {hw.inference_device}  "
         f"([bold]{_fmt_mb(available_mb)}[/bold] available)\n"
     )
+
+    # Show which directory we're downloading to, if any
+    if "--local-dir" in extra_args:
+        idx = extra_args.index("--local-dir")
+        if idx + 1 < len(extra_args):
+            err.print(f"[dim]Download destination:[/dim] [bold]{extra_args[idx + 1]}[/bold]\n")
 
     with err.status(f"Checking model [bold]{repo_id}[/bold]…"):
         try:
@@ -299,22 +397,17 @@ def cmd_download(repo_id: str, extra_args: tuple) -> None:
             f"{mem.dtype}).[/green]\n"
         )
     else:
-        param_count = mem.param_count  # narrowed: not None because fits_in returned False with a value
+        param_count = mem.param_count
         native_mb = mem.native_vram_mb or 0
-        # Model does NOT fit natively
         err.print(
             f"[bold red]✗ {repo_id}[/bold red] requires "
             f"[bold]{_fmt_mb(native_mb)}[/bold] at {mem.dtype}, "
             f"but you have [bold]{_fmt_mb(available_mb)}[/bold] available."
         )
-
         if can_fit_with_any_quant(param_count, available_mb):
             options = suggest_quantizations(param_count, available_mb)
-            err.print(
-                "\n[bold yellow]The model can fit with quantization:[/bold yellow]"
-            )
+            err.print("\n[bold yellow]The model can fit with quantization:[/bold yellow]")
             _print_quant_table(options)
-
             best = options[0]
             err.print(
                 f"\n[bold]Recommendation[/bold]: "
@@ -333,13 +426,12 @@ def cmd_download(repo_id: str, extra_args: tuple) -> None:
                 "  • Running inference on CPU (slow but functional)\n"
                 "  • Cloud-based inference\n"
             )
-
         if not _confirm_proceed():
             err.print("[dim]Download cancelled.[/dim]")
             sys.exit(0)
 
-    # Forward to the real hub CLI
-    _forward_to_hub_cli(["download", repo_id] + list(extra_args))
+    _forward_to_hub_cli(["download", repo_id] + extra_args)
+
 
 
 def _print_quant_table(options: List[QuantOption]) -> None:
