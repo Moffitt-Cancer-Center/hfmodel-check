@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hfmodel-check"
+version = "0.1.0"
+description = "Hardware-aware wrapper for the HuggingFace Hub CLI"
+requires-python = ">=3.10"
+dependencies = [
+    "huggingface_hub>=0.20.0",
+    "rich>=13.0.0",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+# Installs as both `hf` (replaces hub CLI) and `hfw` (safe alias)
+hf  = "hf_wrapper.cli:main"
+hfw = "hf_wrapper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hf_wrapper*"]
