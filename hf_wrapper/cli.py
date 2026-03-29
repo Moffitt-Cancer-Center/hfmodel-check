@@ -21,6 +21,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from hf_wrapper.constants import COMMON_TAGS, PIPELINE_TAGS
 from hf_wrapper.hardware import detect_hardware, HardwareInfo
 from hf_wrapper.model_info import (
     get_model_memory_info,
@@ -132,6 +133,24 @@ def cmd_hardware() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Shell-completion helpers
+# ---------------------------------------------------------------------------
+
+def _complete_task(ctx, param, incomplete):
+    from click.shell_completion import CompletionItem
+    lower = incomplete.lower()
+    return [CompletionItem(t) for t in PIPELINE_TAGS if t.startswith(lower)]
+
+
+def _complete_tag(ctx, param, incomplete):
+    from click.shell_completion import CompletionItem
+    lower = incomplete.lower()
+    prefix  = [t for t in COMMON_TAGS if t.startswith(lower)]
+    substr  = [t for t in COMMON_TAGS if lower in t and not t.startswith(lower)]
+    return [CompletionItem(t) for t in prefix + substr]
+
+
+# ---------------------------------------------------------------------------
 # `hf search`
 # ---------------------------------------------------------------------------
 
@@ -152,7 +171,16 @@ def cmd_hardware() -> None:
 @click.option(
     "--task",
     default=None,
-    help="Filter by pipeline tag (e.g. text-generation, fill-mask).",
+    type=click.Choice(PIPELINE_TAGS, case_sensitive=False),
+    shell_complete=_complete_task,
+    help="Filter by pipeline task.",
+)
+@click.option(
+    "--tag",
+    "tags",
+    multiple=True,
+    shell_complete=_complete_tag,
+    help="Filter by Hub tag (repeatable: --tag pytorch --tag en).",
 )
 @click.option(
     "--download",
@@ -167,6 +195,7 @@ def cmd_search(
     limit: int,
     show_all: bool,
     task: Optional[str],
+    tags: tuple,
     download_index: Optional[int],
 ) -> None:
     """
@@ -198,6 +227,8 @@ def cmd_search(
         )
         if task:
             kwargs["pipeline_tag"] = task
+        if tags:
+            kwargs["filter"] = list(tags)
         try:
             models = list(api.list_models(**kwargs))
         except Exception as exc:
@@ -500,8 +531,9 @@ def cli(ctx: click.Context) -> None:
 
     \b
     New commands (hardware-aware):
-      hardware   Show detected GPU/VRAM and available memory
-      search     Search models filtered to what fits your hardware
+      hardware    Show detected GPU/VRAM and available memory
+      search      Search models filtered to what fits your hardware
+      completion  Print shell tab-completion setup instructions
 
     Enhanced commands:
       download   Hardware compatibility check before downloading
@@ -515,9 +547,54 @@ def cli(ctx: click.Context) -> None:
         click.echo(ctx.get_help())
 
 
+# ---------------------------------------------------------------------------
+# `hf completion`
+# ---------------------------------------------------------------------------
+
+@click.command("completion")
+@click.argument(
+    "shell",
+    type=click.Choice(["bash", "zsh", "fish"], case_sensitive=False),
+    default="zsh",
+    required=False,
+)
+def cmd_completion(shell: str) -> None:
+    """
+    Print shell tab-completion setup instructions.
+
+    SHELL defaults to zsh. Supported: bash, zsh, fish.
+
+    \b
+    Quick setup:
+      eval "$(hfw completion zsh)"   # add to ~/.zshrc
+      eval "$(hfw completion bash)"  # add to ~/.bashrc
+    """
+    shell = shell.lower()
+    prog = "hfw"  # use the non-shadowing alias
+    env_var = f"_{prog.upper()}_COMPLETE"
+
+    if shell == "zsh":
+        out.print(
+            f'# Add to ~/.zshrc — enables tab-completion for {prog}:\n'
+            f'eval "$({env_var}=zsh_source {prog})"'
+        )
+    elif shell == "bash":
+        out.print(
+            f'# Add to ~/.bashrc — enables tab-completion for {prog}:\n'
+            f'eval "$({env_var}=bash_source {prog})"'
+        )
+    elif shell == "fish":
+        out.print(
+            f'# Run once to install fish completions for {prog}:\n'
+            f'{env_var}=fish_source {prog} '
+            f'> ~/.config/fish/completions/{prog}.fish'
+        )
+
+
 cli.add_command(cmd_hardware)
 cli.add_command(cmd_search)
 cli.add_command(cmd_download)
+cli.add_command(cmd_completion)
 
 
 def main() -> None:
