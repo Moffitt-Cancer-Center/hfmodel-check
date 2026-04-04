@@ -171,19 +171,117 @@ def _parse_mem_string(s: str) -> Optional[int]:
 # NVIDIA
 # ---------------------------------------------------------------------------
 
+def _parse_mig_from_list(output: str) -> List[GPUInfo]:
+    """
+    Parse MIG entries from ``nvidia-smi -L``.
+
+    On MIG-enabled systems the output looks like::
+
+        GPU 0: NVIDIA A30 (UUID: GPU-...)
+          MIG 2g.12gb     Device  0: (UUID: MIG-...)
+          MIG 2g.12gb     Device  1: (UUID: MIG-...)
+
+    VRAM is derived from the profile name (e.g. ``2g.12gb`` → 12 × 1024 MiB).
+    This is the nominal value; actual framebuffer may differ by a few hundred
+    MiB (e.g. A30 2g.12gb = 12032 MiB vs 12 × 1024 = 12288 MiB).
+    """
+    gpus: List[GPUInfo] = []
+    current_gpu = ""
+    for line in output.splitlines():
+        gm = re.match(r"^GPU \d+: (.+?) \(UUID:", line)
+        if gm:
+            current_gpu = gm.group(1).strip()
+            continue
+        mm = re.match(r"\s+MIG\s+(\S+)\s+Device\s+\d+", line)
+        if mm:
+            profile = mm.group(1)                   # e.g. "2g.12gb"
+            pm = re.search(r"(\d+(?:\.\d+)?)gb", profile, re.IGNORECASE)
+            if pm:
+                vram_mb = int(float(pm.group(1)) * 1024)
+                name = f"{current_gpu} MIG {profile}" if current_gpu else f"MIG {profile}"
+                gpus.append(GPUInfo(name=name, vram_mb=vram_mb, is_mig_slice=True))
+    return gpus
+
+
+def _parse_mig_from_text(output: str) -> List[GPUInfo]:
+    """
+    Parse MIG device rows from the plain ``nvidia-smi`` ASCII table.
+
+    Matches data rows like::
+
+        |  0    1   0   0  |              72MiB / 12032MiB    | ...
+
+    and reads the total shared-memory column (12032 in the example).
+    Parent GPU names are fetched via a separate ``--query-gpu`` call for labels.
+    """
+    # Quick check: is there a MIG section at all?
+    if "MIG devices:" not in output:
+        return []
+
+    # Collect parent GPU names for richer labels.
+    parent_names: dict = {}
+    name_raw = _run(["nvidia-smi", "--query-gpu=index,name",
+                     "--format=csv,noheader"])
+    if name_raw:
+        for ln in name_raw.splitlines():
+            pr = [p.strip() for p in ln.split(",", 1)]
+            if len(pr) == 2:
+                try:
+                    parent_names[int(pr[0])] = pr[1]
+                except ValueError:
+                    pass
+
+    gpus: List[GPUInfo] = []
+    in_mig = False
+    for line in output.splitlines():
+        if "MIG devices:" in line:
+            in_mig = True
+            continue
+        if not in_mig:
+            continue
+        # Match: | GPU_IDX  GI  CI  MIG_DEV |  used MiB / total MiB  |
+        m = re.search(
+            r"^\|\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\|\s+\d+MiB\s*/\s*(\d+)MiB",
+            line,
+        )
+        if m:
+            gpu_idx = int(m.group(1))
+            vram_mb = int(m.group(2))
+            parent = parent_names.get(gpu_idx, f"GPU {gpu_idx}")
+            gpus.append(GPUInfo(
+                name=f"{parent} MIG slice",
+                vram_mb=vram_mb,
+                is_mig_slice=True,
+            ))
+    return gpus
+
+
 def _detect_nvidia_mig() -> List[GPUInfo]:
     """
-    Detect NVIDIA MIG instances visible to the current process.
+    Detect NVIDIA MIG slices visible to the current process.
 
-    Returns a list of GPUInfo entries (one per MIG slice) only when MIG mode
-    is active on at least one GPU.  Returns an empty list otherwise so the
-    caller falls back to whole-GPU detection.
+    Four-tier fallback chain (attempts each in order):
 
-    Each reported MIG slice carries ``is_mig_slice=True`` so downstream code
-    knows that within-node cross-slice sharding is NOT possible (slices are
-    hardware-isolated) — only cross-node tensor-parallel scaling applies.
+    1. ``--query-mig-device=index,name,memory.total``
+       Structured query — exact framebuffer.  May fail on some driver versions
+       (e.g. when the user lacks NVML MIG enumeration privileges, or on newer
+       CUDA toolkits where the field list changed).
+
+    2. ``nvidia-smi -L``
+       Lists MIG device entries with profile names (e.g. ``2g.12gb``).
+       VRAM is derived from the profile name — accurate to ±256 MiB.
+
+    3. Plain ``nvidia-smi`` text output
+       Parses the ASCII MIG device table to extract exact framebuffer values.
+       Works even when structured queries fail.
+
+    4. Parent-GPU fallback
+       If all slice-enumeration methods fail, the parent GPU is reported with
+       ``is_mig_slice=True`` so the MIG flag is still communicated to the user.
+
+    Returns ``[]`` when MIG is not enabled.
     """
-    # 1. Check whether any GPU in the node has MIG mode enabled.
+    # ── Is MIG mode enabled? ──────────────────────────────────────────────
     mig_check = _run([
         "nvidia-smi",
         "--query-gpu=mig.mode.current",
@@ -192,33 +290,66 @@ def _detect_nvidia_mig() -> List[GPUInfo]:
     if not mig_check or "Enabled" not in mig_check:
         return []
 
-    # 2. Enumerate all accessible MIG device instances.
-    #    --query-mig-device lists instances visible in the current CUDA context
-    #    (respects CUDA_VISIBLE_DEVICES / cgroups in a Slurm job).
-    mig_out = _run([
+    # ── Tier 1: structured query (tries two field sets) ──────────────────
+    for fields in ("index,name,memory.total", "name,memory.total"):
+        raw = _run([
+            "nvidia-smi",
+            f"--query-mig-device={fields}",
+            "--format=csv,noheader,nounits",
+        ])
+        if raw:
+            gpus: List[GPUInfo] = []
+            for line in raw.splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                try:
+                    # Last field is always memory_mb; second-to-last is name.
+                    vram = int(parts[-1])
+                    name = parts[-2]
+                    gpus.append(GPUInfo(name=name, vram_mb=vram, is_mig_slice=True))
+                except (ValueError, IndexError):
+                    pass
+            if gpus:
+                return gpus
+
+    # ── Tier 2: nvidia-smi -L (profile name → nominal VRAM) ──────────────
+    list_out = _run(["nvidia-smi", "-L"])
+    if list_out:
+        gpus = _parse_mig_from_list(list_out)
+        if gpus:
+            return gpus
+
+    # ── Tier 3: parse plain nvidia-smi ASCII table (exact framebuffer) ───
+    text_out = _run(["nvidia-smi"])
+    if text_out:
+        gpus = _parse_mig_from_text(text_out)
+        if gpus:
+            return gpus
+
+    # ── Tier 4: last resort — mark parent GPU(s) as MIG-active ───────────
+    # All slice-enumeration methods failed.  Report the parent GPU with the
+    # MIG flag set so downstream code still shows the MIG isolation warning.
+    full_out = _run([
         "nvidia-smi",
-        "--query-mig-device=index,name,memory.total",
+        "--query-gpu=name,memory.total",
         "--format=csv,noheader,nounits",
     ])
-    if not mig_out:
-        return []
-
-    gpus: List[GPUInfo] = []
-    for line in mig_out.splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 3:
-            try:
-                # parts[0] = index, parts[1] = name, parts[2] = memory MB
-                gpus.append(
-                    GPUInfo(
-                        name=parts[1],
-                        vram_mb=int(parts[2]),
+    if full_out:
+        gpus = []
+        for line in full_out.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2:
+                try:
+                    gpus.append(GPUInfo(
+                        name=f"{parts[0]} (MIG enabled, slice sizes unknown)",
+                        vram_mb=int(parts[1]),
                         is_mig_slice=True,
-                    )
-                )
-            except ValueError:
-                pass
-    return gpus
+                    ))
+                except ValueError:
+                    pass
+        if gpus:
+            return gpus
+
+    return []
 
 
 def _detect_nvidia() -> List[GPUInfo]:
