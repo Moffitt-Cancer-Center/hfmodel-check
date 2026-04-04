@@ -53,6 +53,22 @@ class HardwareInfo:
         return any(g.is_unified_memory for g in self.gpus)
 
     @property
+    def gpu_count(self) -> int:
+        return len(self.gpus)
+
+    @property
+    def homogeneous_gpu_count(self) -> int:
+        """
+        Number of GPUs that share the same VRAM size as the best GPU.
+        Used for tensor-parallel sharding estimates.
+        On heterogeneous nodes (rare) only the matching GPUs are counted.
+        """
+        if not self.gpus:
+            return 0
+        best_vram = self.best_gpu_vram_mb
+        return sum(1 for g in self.gpus if g.vram_mb == best_vram)
+
+    @property
     def effective_memory_mb(self) -> int:
         """
         Memory available for model inference.

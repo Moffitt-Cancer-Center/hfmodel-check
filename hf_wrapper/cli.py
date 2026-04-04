@@ -33,7 +33,10 @@ from hf_wrapper.quantization import (
     best_quantization,
     fits_natively,
     can_fit_with_any_quant,
+    suggest_sharding,
+    min_gpus_for_model,
     QuantOption,
+    ShardingOption,
 )
 
 # Two consoles: status/warnings → stderr so stdout stays pipe-friendly
@@ -100,8 +103,15 @@ def _fmt_mb(mb: int) -> str:
 def _status_cell(
     mem: ModelMemoryInfo,
     available_mb: int,
+    per_gpu_vram_mb: int = 0,
+    max_gpus: int = 1,
 ) -> tuple[str, str]:
-    """Return (status_text, rich_style) for a model's fit status."""
+    """Return (status_text, rich_style) for a model's fit status.
+
+    When *max_gpus* > 1 and the model doesn't fit in a single GPU, the cell
+    will show the minimum GPU count required for sharding rather than a plain
+    red "too large" label.
+    """
     if mem.native_vram_mb is None or mem.param_count is None:
         return "? unknown size", "dim"
 
@@ -115,6 +125,19 @@ def _status_cell(
         if best:
             label = best.level.key.upper()
             return f"~ {label} ({_fmt_mb(best.estimated_vram_mb)})", "yellow"
+
+    # Doesn't fit on a single GPU even with quantization.
+    # If we have multi-GPU info, try sharding.
+    if max_gpus > 1 and per_gpu_vram_mb > 0:
+        shard_opts = suggest_sharding(param_count, per_gpu_vram_mb, max_gpus=max_gpus)
+        for opt in shard_opts:
+            if opt.gpu_count == 1:
+                continue  # already checked above
+            if opt.native_fits:
+                return f"↕ {opt.gpu_count}× GPU (native)", "cyan"
+            if opt.best_quant:
+                tag = opt.best_quant.level.key.upper()
+                return f"↕ {opt.gpu_count}× GPU (~{tag})", "bright_cyan"
 
     return f"✗ too large ({_fmt_mb(mem.native_vram_mb)})", "red"
 
@@ -130,6 +153,19 @@ def cmd_hardware() -> None:
     out.print("\n[bold cyan]Detected Hardware[/bold cyan]")
     out.print(hw.summary())
     out.print()
+
+    if hw.homogeneous_gpu_count > 1:
+        per_gpu_mb = hw.best_gpu_vram_mb
+        total_mb = hw.homogeneous_gpu_count * per_gpu_mb
+        out.print(
+            f"[bold cyan]Multi-GPU config[/bold cyan]: "
+            f"[bold]{hw.homogeneous_gpu_count}×[/bold] {hw.gpus[0].name}  "
+            f"([bold]{_fmt_mb(per_gpu_mb)}[/bold] each, "
+            f"[bold]{_fmt_mb(total_mb)}[/bold] total tensor-parallel budget)\n"
+            f"[dim]Use [bold]hfw search <query> --gpus {hw.homogeneous_gpu_count}[/bold] "
+            f"to include shardable models in search results.[/dim]"
+        )
+        out.print()
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +226,16 @@ def _complete_tag(ctx, param, incomplete):
     metavar="N",
     help="Download result number N without interactive prompt (1-based).",
 )
+@click.option(
+    "--gpus",
+    default=None,
+    type=int,
+    metavar="N",
+    help=(
+        "Maximum number of GPUs per node to consider for sharding "
+        "(default: detected GPU count, min 1)."
+    ),
+)
 def cmd_search(
     query: str,
     limit: int,
@@ -197,11 +243,13 @@ def cmd_search(
     task: Optional[str],
     tags: tuple,
     download_index: Optional[int],
+    gpus: Optional[int],
 ) -> None:
     """
     Search HuggingFace Hub for QUERY, showing only models compatible with
     your hardware.  Models that need quantization to fit are marked with the
-    recommended quant level.
+    recommended quant level.  Models that require sharding across multiple
+    GPUs are shown with cyan ↕ markers.
 
     After results are shown you will be prompted to download a model by
     entering its result number.  Pass --download N to skip the prompt.
@@ -210,9 +258,16 @@ def cmd_search(
 
     hw = get_hw()
     available_mb = hw.effective_memory_mb
+    per_gpu_vram_mb = hw.best_gpu_vram_mb
+    max_gpus = gpus if gpus is not None else hw.homogeneous_gpu_count
+    max_gpus = max(max_gpus, 1)
+
+    gpu_note = ""
+    if max_gpus > 1:
+        gpu_note = f"  [dim]({max_gpus}× GPU sharding on)[/dim]"
 
     err.print(f"\n[bold cyan]Hardware[/bold cyan]: {hw.inference_device}  "
-              f"([bold]{_fmt_mb(available_mb)}[/bold] available)")
+              f"([bold]{_fmt_mb(available_mb)}[/bold] available){gpu_note}")
     err.print(f"[dim]Searching for models matching '[bold]{query}[/bold]'…[/dim]\n")
 
     api = HfApi()
@@ -269,15 +324,24 @@ def cmd_search(
         mem = estimate_from_listing(info)
         fits = mem.fits_in(available_mb)
         can_quant = mem.param_count and can_fit_with_any_quant(mem.param_count, available_mb)
+        # Can it fit via sharding across available GPUs?
+        can_shard = False
+        if not fits and not can_quant and mem.param_count and max_gpus > 1:
+            shard_opts = suggest_sharding(mem.param_count, per_gpu_vram_mb, max_gpus=max_gpus)
+            can_shard = any(o.is_viable for o in shard_opts if o.gpu_count > 1)
         size_known = mem.param_count is not None
 
-        if not show_all and not fits and not can_quant and size_known:
+        if not show_all and not fits and not can_quant and not can_shard and size_known:
             continue
 
         shown_models.append(info.id or "")
         idx = len(shown_models)
 
-        status_text, status_style = _status_cell(mem, available_mb)
+        status_text, status_style = _status_cell(
+            mem, available_mb,
+            per_gpu_vram_mb=per_gpu_vram_mb,
+            max_gpus=max_gpus,
+        )
 
         downloads = getattr(info, "downloads", None)
         dl_str = f"{downloads:,}" if downloads else "—"
@@ -299,16 +363,22 @@ def cmd_search(
         return
 
     out.print(table)
+    legend_parts = [
+        "Green = fits natively",
+        "Yellow = fits with quantization",
+        "Cyan ↕ = requires multi-GPU sharding",
+        "Red = too large",
+    ]
     out.print(
         f"\n[dim]Showed {len(shown_models)}/{len(models)} models. "
-        f"Green = fits natively, Yellow = fits with quantization, "
-        f"Red = too large even with Q2.[/dim]"
+        + "  ".join(legend_parts)
+        + "[/dim]"
     )
     if not show_all:
         hidden = len(models) - len(shown_models)
         if hidden:
             out.print(
-                f"[dim]{hidden} model(s) hidden (too large). "
+                f"[dim]{hidden} model(s) hidden (too large even for {max_gpus}× GPU). "
                 f"Use --show-all to see them.[/dim]"
             )
 
@@ -449,14 +519,45 @@ def _run_download_with_check(repo_id: str, extra_args: List[str]) -> None:
                 f"Or convert locally with [cyan]llama.cpp[/cyan] / [cyan]ollama[/cyan].\n"
             )
         else:
-            err.print(
-                "[bold red]This model cannot fit in your hardware memory even "
-                "with the most aggressive quantization (Q2).[/bold red]\n"
-                "Consider:\n"
-                "  • A smaller model variant (fewer parameters)\n"
-                "  • Running inference on CPU (slow but functional)\n"
-                "  • Cloud-based inference\n"
-            )
+            # Single-GPU quant won't help — show multi-GPU sharding options
+            per_gpu_mb = hw.best_gpu_vram_mb
+            gpu_name = hw.gpus[0].name if hw.gpus else "GPU"
+            if per_gpu_mb > 0:
+                shard_opts = suggest_sharding(param_count, per_gpu_mb, max_gpus=8)
+                viable = [o for o in shard_opts if o.is_viable and o.gpu_count > 1]
+                if viable:
+                    err.print(
+                        "\n[bold cyan]Single-GPU options exhausted. "
+                        "Multi-GPU (tensor-parallel) sharding options:[/bold cyan]"
+                    )
+                    _print_sharding_table(shard_opts, gpu_name=gpu_name)
+                    min_opt = viable[0]
+                    tp_flag = f"--tensor-parallel-size {min_opt.gpu_count}"
+                    err.print(
+                        f"\n[bold]Minimum config[/bold]: "
+                        f"[bold cyan]{min_opt.gpu_count}× {gpu_name}[/bold cyan] "
+                        f"([bold]{_fmt_mb(min_opt.total_vram_mb)}[/bold] total)\n"
+                        f"Launch with vLLM: [cyan]vllm serve {repo_id} {tp_flag}[/cyan]\n"
+                    )
+                else:
+                    err.print(
+                        "[bold red]This model cannot fit in your hardware memory even "
+                        "with the most aggressive quantization (Q2) or sharding across "
+                        "up to 8 GPUs of this type.[/bold red]\n"
+                        "Consider:\n"
+                        "  • A smaller model variant (fewer parameters)\n"
+                        "  • A node with more / larger GPUs\n"
+                        "  • Cloud-based inference\n"
+                    )
+            else:
+                err.print(
+                    "[bold red]This model cannot fit in your hardware memory even "
+                    "with the most aggressive quantization (Q2).[/bold red]\n"
+                    "Consider:\n"
+                    "  • A smaller model variant (fewer parameters)\n"
+                    "  • Running inference on CPU (slow but functional)\n"
+                    "  • Cloud-based inference\n"
+                )
         if not _confirm_proceed():
             err.print("[dim]Download cancelled.[/dim]")
             sys.exit(0)
@@ -484,6 +585,43 @@ def _print_quant_table(options: List[QuantOption]) -> None:
             _fmt_mb(opt.estimated_vram_mb),
             Text(opt.level.quality_tag, style=color),
             Text(opt.level.notes, style="dim"),
+        )
+    err.print(table)
+
+
+def _print_sharding_table(
+    options: List[ShardingOption],
+    gpu_name: str = "GPU",
+) -> None:
+    """Print a tensor-parallel scaling table to stderr."""
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        padding=(0, 1),
+    )
+    table.add_column("GPUs (TP)", justify="center", min_width=10)
+    table.add_column("Total VRAM", justify="right", min_width=11)
+    table.add_column("Fits natively?", justify="center", min_width=14)
+    table.add_column("Best option", min_width=28)
+
+    for opt in options:
+        if opt.native_fits:
+            fits_cell = Text("✓ yes", style="green")
+            best_cell = Text("BF16 / FP16 (native)", style="green")
+        elif opt.best_quant:
+            fits_cell = Text("~ quant", style="yellow")
+            label = opt.best_quant.level.display
+            vram = _fmt_mb(opt.best_quant.estimated_vram_mb)
+            best_cell = Text(f"{label}  (~{vram})", style=opt.best_quant.quality_color)
+        else:
+            fits_cell = Text("✗ no", style="red")
+            best_cell = Text("too large even at Q2", style="dim")
+
+        table.add_row(
+            Text(f"{opt.gpu_count}× {gpu_name}", style="cyan"),
+            _fmt_mb(opt.total_vram_mb),
+            fits_cell,
+            best_cell,
         )
     err.print(table)
 

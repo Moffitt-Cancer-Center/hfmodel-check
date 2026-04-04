@@ -4,6 +4,7 @@ quantization.py — Determine which quantizations fit in available GPU memory.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -123,3 +124,95 @@ def can_fit_with_any_quant(param_count: int, available_mb: int) -> bool:
     most_aggressive = QUANT_LEVELS[-1]
     min_vram = int(param_count * most_aggressive.bytes_per_param * INFERENCE_OVERHEAD / (1024 * 1024))
     return min_vram <= available_mb
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU / tensor-parallel sharding
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ShardingOption:
+    """Describes how a model can be served across N GPUs on the same node."""
+    gpu_count: int               # tensor-parallel degree (1, 2, 4, 8, …)
+    per_gpu_vram_mb: int         # VRAM available on each GPU
+    total_vram_mb: int           # gpu_count × per_gpu_vram_mb
+    native_fits: bool            # model at native dtype fits within total_vram
+    best_quant: Optional[QuantOption]  # best quant if native doesn't fit, else None
+
+    @property
+    def is_viable(self) -> bool:
+        """True if the model can run at this GPU count (natively or quantized)."""
+        return self.native_fits or self.best_quant is not None
+
+    @property
+    def status_label(self) -> tuple[str, str]:
+        """Return (text, rich_style) for display."""
+        if self.native_fits:
+            return f"{self.gpu_count}× GPU  (native)", "green"
+        if self.best_quant:
+            tag = self.best_quant.level.key.upper()
+            return f"{self.gpu_count}× GPU  (~{tag})", "yellow"
+        return f"{self.gpu_count}× GPU  too large", "red"
+
+
+_TP_STEPS = (1, 2, 4, 8, 16)   # standard tensor-parallel sizes
+
+
+def suggest_sharding(
+    param_count: int,
+    per_gpu_vram_mb: int,
+    max_gpus: int = 8,
+) -> List[ShardingOption]:
+    """
+    Return sharding options for increasing GPU counts (1, 2, 4, 8, …) up to
+    *max_gpus*, describing whether the model fits at each scale.
+
+    Tensor parallelism splits the model weight across GPUs so the effective
+    VRAM budget is ``gpu_count × per_gpu_vram_mb``.
+
+    Example::
+
+        opts = suggest_sharding(70_000_000_000, per_gpu_vram_mb=40_960, max_gpus=8)
+        for o in opts:
+            print(o.gpu_count, o.native_fits, o.best_quant)
+    """
+    options: List[ShardingOption] = []
+    for n in _TP_STEPS:
+        if n > max_gpus:
+            break
+        total_mb = n * per_gpu_vram_mb
+        nat_fits = native_vram_mb(param_count) <= total_mb
+        best = None if nat_fits else best_quantization(param_count, total_mb)
+        options.append(
+            ShardingOption(
+                gpu_count=n,
+                per_gpu_vram_mb=per_gpu_vram_mb,
+                total_vram_mb=total_mb,
+                native_fits=nat_fits,
+                best_quant=best,
+            )
+        )
+        if nat_fits:
+            # No point showing larger configs once it already fits natively.
+            break
+    return options
+
+
+def min_gpus_for_model(
+    param_count: int,
+    per_gpu_vram_mb: int,
+    dtype: str = "bf16",
+) -> Optional[int]:
+    """
+    Return the minimum number of homogeneous GPUs needed to run the model at
+    *dtype* natively, or ``None`` if even 16 GPUs wouldn't be enough.
+    """
+    needed_mb = native_vram_mb(param_count, dtype)
+    if per_gpu_vram_mb <= 0:
+        return None
+    n = math.ceil(needed_mb / per_gpu_vram_mb)
+    # Tensor parallelism must be a power-of-two (or TP=1)
+    tp = 1
+    while tp < n:
+        tp *= 2
+    return tp if tp <= 16 else None
