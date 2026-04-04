@@ -45,6 +45,7 @@ from hf_wrapper.cluster import (
     suggest_node_scaling,
     compare_with_catalog,
     node_spec_from_gpu,
+    node_spec_from_hardware,
 )
 
 # Two consoles: status/warnings → stderr so stdout stays pipe-friendly
@@ -111,42 +112,64 @@ def _fmt_mb(mb: int) -> str:
 def _status_cell(
     mem: ModelMemoryInfo,
     available_mb: int,
-    per_gpu_vram_mb: int = 0,
-    max_gpus: int = 1,
-    shard_unit: str = "GPU",
+    node_spec: Optional[NodeSpec] = None,
+    max_nodes: int = 64,
 ) -> tuple[str, str]:
     """Return (status_text, rich_style) for a model's fit status.
 
-    *shard_unit* controls the label for multi-unit sharding:
-      "GPU"  — within-node GPU sharding
-      "node" — cross-node sharding (caller passes total-GPU budget via max_gpus)
+    Scaling tiers (first match wins):
+      1. Fits on single GPU / MIG slice  → green  ✓
+      2. Fits with quantization (1 unit) → yellow ~
+      3. Fits on single node (multi-GPU) → cyan   ↕ Nx GPU  (native or ~quant)
+      4. Fits across N nodes             → cyan   ↕ Nx node (native or ~quant)
+      5. Nothing fits within max_nodes   → red    ✗
+
+    *node_spec* describes the node layout (gpu_count, vram_per_gpu_mb).
+    *max_nodes* caps the cross-node search (default 64 for discovery).
     """
     if mem.native_vram_mb is None or mem.param_count is None:
         return "? unknown size", "dim"
 
-    param_count: int = mem.param_count  # narrowed
+    param_count: int = mem.param_count
 
+    # ── Tier 1: single GPU / MIG slice ───────────────────────────────────
     if mem.fits_in(available_mb):
         return f"✓ fits  ({_fmt_mb(mem.native_vram_mb)})", "green"
 
+    # ── Tier 2: quantization on single unit ──────────────────────────────
     if can_fit_with_any_quant(param_count, available_mb):
         best = best_quantization(param_count, available_mb)
         if best:
-            label = best.level.key.upper()
-            return f"~ {label} ({_fmt_mb(best.estimated_vram_mb)})", "yellow"
+            return f"~ {best.level.key.upper()} ({_fmt_mb(best.estimated_vram_mb)})", "yellow"
 
-    # Doesn't fit on a single unit even with quantization — try sharding.
-    if max_gpus > 1 and per_gpu_vram_mb > 0:
-        shard_opts = suggest_sharding(param_count, per_gpu_vram_mb, max_gpus=max_gpus)
-        for opt in shard_opts:
-            if opt.gpu_count == 1:
-                continue  # already checked above
-            unit_label = f"{opt.gpu_count}× {shard_unit}"
-            if opt.native_fits:
-                return f"↕ {unit_label} (native)", "cyan"
-            if opt.best_quant:
-                tag = opt.best_quant.level.key.upper()
-                return f"↕ {unit_label} (~{tag})", "bright_cyan"
+    # ── Tiers 3 & 4: multi-unit sharding via NodeSpec ────────────────────
+    if node_spec is not None:
+        opts = suggest_node_scaling(param_count, node_spec, max_nodes=max_nodes)
+        for opt in opts:
+            if not opt.is_viable:
+                continue
+            n = opt.node_count
+
+            # Tier 3 — within-node multi-GPU (n=1, but gpu_count>1)
+            if n == 1 and node_spec.gpu_count > 1:
+                label = f"↕ {node_spec.gpu_count}× GPU"
+                q = opt.best_quant
+                if opt.native_fits:
+                    return f"{label} (native)", "cyan"
+                if q:
+                    return f"{label} (~{q.level.key.upper()})", "bright_cyan"
+
+            # Tier 4 — cross-node
+            elif n > 1:
+                if node_spec.gpu_count == 1:
+                    label = f"↕ {n}× node"
+                else:
+                    label = f"↕ {n}× node ({n * node_spec.gpu_count} GPU)"
+                q = opt.best_quant
+                if opt.native_fits:
+                    return f"{label} (native)", "cyan"
+                if q:
+                    return f"{label} (~{q.level.key.upper()})", "bright_cyan"
 
     return f"✗ too large ({_fmt_mb(mem.native_vram_mb)})", "red"
 
@@ -163,16 +186,22 @@ def cmd_hardware() -> None:
     out.print(hw.summary())
     out.print()
 
-    if hw.homogeneous_gpu_count > 1:
+    if hw.has_mig:
+        out.print(
+            "[bold cyan]MIG note[/bold cyan]: Slices are hardware-isolated — "
+            "within-node cross-slice tensor-parallel is not supported.\n"
+            "[dim]Cross-node scaling (one MIG slice per node) is fully supported "
+            "and shown automatically in [bold]hfw search[/bold] results.[/dim]"
+        )
+        out.print()
+    elif hw.homogeneous_gpu_count > 1:
         per_gpu_mb = hw.best_gpu_vram_mb
         total_mb = hw.homogeneous_gpu_count * per_gpu_mb
         out.print(
             f"[bold cyan]Multi-GPU config[/bold cyan]: "
             f"[bold]{hw.homogeneous_gpu_count}×[/bold] {hw.gpus[0].name}  "
             f"([bold]{_fmt_mb(per_gpu_mb)}[/bold] each, "
-            f"[bold]{_fmt_mb(total_mb)}[/bold] total tensor-parallel budget)\n"
-            f"[dim]Use [bold]hfw search <query> --gpus {hw.homogeneous_gpu_count}[/bold] "
-            f"to include shardable models in search results.[/dim]"
+            f"[bold]{_fmt_mb(total_mb)}[/bold] total within-node tensor-parallel budget)"
         )
         out.print()
 
@@ -211,7 +240,10 @@ def _complete_tag(ctx, param, incomplete):
     "--show-all",
     is_flag=True,
     default=False,
-    help="Include models that cannot fit even with maximum quantization.",
+    help=(
+        "Include models that cannot fit even with maximum quantization "
+        "and cross-node sharding up to --max-nodes."
+    ),
 )
 @click.option(
     "--task",
@@ -236,24 +268,16 @@ def _complete_tag(ctx, param, incomplete):
     help="Download result number N without interactive prompt (1-based).",
 )
 @click.option(
-    "--gpus",
-    default=None,
+    "--max-nodes",
+    default=64,
+    show_default=True,
     type=int,
     metavar="N",
     help=(
-        "GPUs per node to consider for within-node sharding "
-        "(default: detected GPU count, min 1)."
-    ),
-)
-@click.option(
-    "--nodes",
-    default=None,
-    type=int,
-    metavar="N",
-    help=(
-        "Number of identical nodes available from the queue for cross-node "
-        "tensor-parallel sharding (e.g. --nodes 4 on a single-GPU-per-node "
-        "cluster means a 4-GPU budget spread across 4 nodes)."
+        "Maximum node count to consider for cross-node scaling.  "
+        "Models that need more than N nodes to run (even at Q2) are hidden "
+        "unless --show-all is passed.  Assumes all nodes in the queue have "
+        "the same GPU as this node."
     ),
 )
 def cmd_search(
@@ -263,17 +287,21 @@ def cmd_search(
     task: Optional[str],
     tags: tuple,
     download_index: Optional[int],
-    gpus: Optional[int],
-    nodes: Optional[int],
+    max_nodes: int,
 ) -> None:
     """
-    Search HuggingFace Hub for QUERY, showing only models compatible with
-    your hardware.  Models that need quantization to fit are marked with the
-    recommended quant level.  Models that require sharding across multiple
-    GPUs or nodes are shown with cyan ↕ markers.
+    Search HuggingFace Hub for QUERY, filtered to what your hardware can run.
 
-    Use --nodes N to model cross-node tensor-parallel budgets (useful on
-    single-GPU-per-node HPC clusters where N jobs share one model).
+    \b
+    Status column key:
+      ✓ green   — fits on this GPU / MIG slice (native dtype)
+      ~ yellow  — fits with quantization on this GPU
+      ↕ cyan    — requires sharding; shows minimum nodes/GPUs needed
+                  (assumes identical nodes in the same Slurm partition)
+      ✗ red     — too large even with Q2 and --max-nodes nodes
+
+    Models are automatically filtered to those runnable within --max-nodes
+    nodes of detected hardware.  Use --show-all to disable the filter.
 
     After results are shown you will be prompted to download a model by
     entering its result number.  Pass --download N to skip the prompt.
@@ -282,35 +310,32 @@ def cmd_search(
 
     hw = get_hw()
     available_mb = hw.effective_memory_mb
-    per_gpu_vram_mb = hw.best_gpu_vram_mb
-    gpus_per_node = gpus if gpus is not None else hw.homogeneous_gpu_count
-    gpus_per_node = max(gpus_per_node, 1)
-    node_count = nodes if nodes is not None else 1
-    node_count = max(node_count, 1)
 
-    # Total GPU budget: gpus_per_node × node_count
-    max_gpus = gpus_per_node * node_count
+    # Build a NodeSpec from detected hardware for auto cross-node scaling.
+    node_spec = node_spec_from_hardware(hw)
 
-    # Label sharding units appropriately
-    # — cross-node, single-GPU-per-node → say "node"
-    # — within-node or multi-GPU-per-node → say "GPU"
-    shard_unit = "node" if (node_count > 1 and gpus_per_node == 1) else "GPU"
-
-    # Header note
-    if node_count > 1:
-        node_budget_mb = node_count * gpus_per_node * per_gpu_vram_mb
-        gpu_note = (
-            f"  [dim]({node_count}× nodes, "
-            f"{_fmt_mb(per_gpu_vram_mb)}/node = "
-            f"[bold]{_fmt_mb(node_budget_mb)}[/bold] tensor-parallel budget)[/dim]"
-        )
-    elif max_gpus > 1:
-        gpu_note = f"  [dim]({max_gpus}× GPU sharding on)[/dim]"
+    # Header line: describe what we're scaling against.
+    if node_spec is not None:
+        if hw.has_mig:
+            hw_note = (
+                f"  [dim](MIG slice; cross-node scaling up to "
+                f"[bold]{max_nodes}[/bold] nodes)[/dim]"
+            )
+        elif node_spec.gpu_count > 1:
+            hw_note = (
+                f"  [dim]({node_spec.gpu_count}× GPU/node; "
+                f"cross-node scaling up to [bold]{max_nodes}[/bold] nodes)[/dim]"
+            )
+        else:
+            hw_note = (
+                f"  [dim](cross-node scaling: up to "
+                f"[bold]{max_nodes}[/bold] nodes assumed identical)[/dim]"
+            )
     else:
-        gpu_note = ""
+        hw_note = ""
 
     err.print(f"\n[bold cyan]Hardware[/bold cyan]: {hw.inference_device}  "
-              f"([bold]{_fmt_mb(available_mb)}[/bold] available){gpu_note}")
+              f"([bold]{_fmt_mb(available_mb)}[/bold] available){hw_note}")
     err.print(f"[dim]Searching for models matching '[bold]{query}[/bold]'…[/dim]\n")
 
     api = HfApi()
@@ -367,11 +392,11 @@ def cmd_search(
         mem = estimate_from_listing(info)
         fits = mem.fits_in(available_mb)
         can_quant = mem.param_count and can_fit_with_any_quant(mem.param_count, available_mb)
-        # Can it fit via sharding across available GPUs?
+        # Can it run via cross-node sharding within max_nodes?
         can_shard = False
-        if not fits and not can_quant and mem.param_count and max_gpus > 1:
-            shard_opts = suggest_sharding(mem.param_count, per_gpu_vram_mb, max_gpus=max_gpus)
-            can_shard = any(o.is_viable for o in shard_opts if o.gpu_count > 1)
+        if not fits and not can_quant and mem.param_count and node_spec is not None:
+            shard_opts = suggest_node_scaling(mem.param_count, node_spec, max_nodes=max_nodes)
+            can_shard = any(o.is_viable for o in shard_opts)
         size_known = mem.param_count is not None
 
         if not show_all and not fits and not can_quant and not can_shard and size_known:
@@ -382,9 +407,8 @@ def cmd_search(
 
         status_text, status_style = _status_cell(
             mem, available_mb,
-            per_gpu_vram_mb=per_gpu_vram_mb,
-            max_gpus=max_gpus,
-            shard_unit=shard_unit,
+            node_spec=node_spec,
+            max_nodes=max_nodes,
         )
 
         downloads = getattr(info, "downloads", None)
@@ -407,24 +431,22 @@ def cmd_search(
         return
 
     out.print(table)
-    shard_desc = f"{max_gpus}× {shard_unit}" if max_gpus > 1 else "1× GPU"
     legend_parts = [
-        "Green = fits natively",
-        "Yellow = fits with quantization",
-        f"Cyan ↕ = requires sharding ({shard_desc} budget)",
-        "Red = too large",
+        "✓ [green]green[/green] = fits natively",
+        "~ [yellow]yellow[/yellow] = fits with quantization",
+        "↕ [cyan]cyan[/cyan] = requires sharding (node count shown)",
+        "✗ [red]red[/red] = too large",
     ]
     out.print(
-        f"\n[dim]Showed {len(shown_models)}/{len(models)} models.  "
+        f"\n[dim]Showed {len(shown_models)}/{len(models)} models.[/dim]  "
         + "  ".join(legend_parts)
-        + "[/dim]"
     )
     if not show_all:
         hidden = len(models) - len(shown_models)
         if hidden:
             out.print(
-                f"[dim]{hidden} model(s) hidden (too large even with {shard_desc}). "
-                f"Use --show-all to see them, or --nodes / --gpus to increase budget.[/dim]"
+                f"[dim]{hidden} model(s) hidden (exceed {max_nodes}-node budget). "
+                f"Use --show-all to see them, or --max-nodes to raise the limit.[/dim]"
             )
 
     # ------------------------------------------------------------------
@@ -564,35 +586,35 @@ def _run_download_with_check(repo_id: str, extra_args: List[str]) -> None:
                 f"Or convert locally with [cyan]llama.cpp[/cyan] / [cyan]ollama[/cyan].\n"
             )
         else:
-            # Single-GPU quant won't help — show multi-GPU sharding options
-            per_gpu_mb = hw.best_gpu_vram_mb
-            gpu_name = hw.gpus[0].name if hw.gpus else "GPU"
-            if per_gpu_mb > 0:
-                shard_opts = suggest_sharding(param_count, per_gpu_mb, max_gpus=8)
-                viable = [o for o in shard_opts if o.is_viable and o.gpu_count > 1]
+            # Single-GPU quant won't help — show cross-node scaling options.
+            dn_node_spec = node_spec_from_hardware(hw)
+            if dn_node_spec is not None:
+                node_opts = suggest_node_scaling(param_count, dn_node_spec, max_nodes=64)
+                viable = [o for o in node_opts if o.is_viable and (o.node_count > 1 or dn_node_spec.gpu_count > 1)]
                 if viable:
                     err.print(
                         "\n[bold cyan]Single-GPU options exhausted. "
-                        "Multi-GPU (tensor-parallel) sharding options:[/bold cyan]"
+                        "Cross-node scaling options:[/bold cyan]"
                     )
-                    _print_sharding_table(shard_opts, gpu_name=gpu_name)
+                    _print_node_scaling_table(
+                        node_opts,
+                        heading=f"Node scaling — {dn_node_spec}",
+                    )
                     min_opt = viable[0]
-                    tp_flag = f"--tensor-parallel-size {min_opt.gpu_count}"
                     err.print(
                         f"\n[bold]Minimum config[/bold]: "
-                        f"[bold cyan]{min_opt.gpu_count}× {gpu_name}[/bold cyan] "
+                        f"[bold cyan]{min_opt.node_count}× node(s)[/bold cyan] "
                         f"([bold]{_fmt_mb(min_opt.total_vram_mb)}[/bold] total)\n"
-                        f"Launch with vLLM: [cyan]vllm serve {repo_id} {tp_flag}[/cyan]\n"
+                        f"[dim]  vllm serve {repo_id} {min_opt.tp_pp_flags}[/dim]\n"
+                        f"[dim]Run [bold]hfw scale {repo_id}[/bold] for a full catalog comparison.[/dim]\n"
                     )
                 else:
                     err.print(
-                        "[bold red]This model cannot fit in your hardware memory even "
-                        "with the most aggressive quantization (Q2) or sharding across "
-                        "up to 8 GPUs of this type.[/bold red]\n"
-                        "Consider:\n"
-                        "  • A smaller model variant (fewer parameters)\n"
-                        "  • A node with more / larger GPUs\n"
-                        "  • Cloud-based inference\n"
+                        "[bold red]This model cannot fit even with Q2 quantization "
+                        "or cross-node sharding across up to 64 nodes of this "
+                        "hardware.[/bold red]\n"
+                        "Run [cyan]hfw scale {repo_id}[/cyan] to compare against "
+                        "advanced node types (H100, MI300X, …).\n"
                     )
             else:
                 err.print(
@@ -816,15 +838,14 @@ def cmd_scale(model_id: str, max_nodes: int, max_catalog_nodes: int) -> None:
 
     # ── Current cluster scaling ────────────────────────────────────────────
     if hw.gpus:
-        gpu_name = hw.gpus[0].name
-        per_gpu_mb = hw.best_gpu_vram_mb
-        gpus_per_node = hw.homogeneous_gpu_count
-        current_node = node_spec_from_gpu(gpu_name, per_gpu_mb, gpus_per_node)
+        current_node = node_spec_from_hardware(hw)
+        assert current_node is not None  # guaranteed since hw.gpus is non-empty
+        if hw.has_mig:
+            heading = f"Current cluster (MIG) — {current_node}"
+        else:
+            heading = f"Current cluster — {current_node}"
         node_opts = suggest_node_scaling(mem.param_count, current_node, max_nodes=max_nodes)
-        _print_node_scaling_table(
-            node_opts,
-            heading=f"Current cluster — {current_node}",
-        )
+        _print_node_scaling_table(node_opts, heading=heading)
 
         # Highlight the minimum viable config
         viable = [o for o in node_opts if o.is_viable]
@@ -842,6 +863,11 @@ def cmd_scale(model_id: str, max_nodes: int, max_catalog_nodes: int) -> None:
                 f"runs {qual}\n"
                 f"[dim]  vllm serve {model_id} {min_opt.tp_pp_flags}[/dim]"
             )
+            if hw.has_mig:
+                out.print(
+                    "[dim]  Note: MIG slices are isolated — allocate one Slurm job "
+                    "per node, then coordinate with vLLM's distributed launcher.[/dim]"
+                )
         else:
             out.print(
                 f"\n[bold red]Cannot fit on up to {max_nodes}× nodes of this "

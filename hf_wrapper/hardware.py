@@ -22,11 +22,14 @@ class GPUInfo:
     name: str
     vram_mb: int
     is_unified_memory: bool = False
+    is_mig_slice: bool = False
 
     def __str__(self) -> str:
         mem = _fmt_mb(self.vram_mb)
         if self.is_unified_memory:
             return f"{self.name} (Unified Memory: {mem})"
+        if self.is_mig_slice:
+            return f"{self.name} (MIG slice: {mem})"
         return f"{self.name} ({mem} VRAM)"
 
 
@@ -53,15 +56,24 @@ class HardwareInfo:
         return any(g.is_unified_memory for g in self.gpus)
 
     @property
+    def has_mig(self) -> bool:
+        """True when the reported GPU unit is a MIG slice, not a full GPU."""
+        return any(g.is_mig_slice for g in self.gpus)
+
+    @property
     def gpu_count(self) -> int:
         return len(self.gpus)
 
     @property
     def homogeneous_gpu_count(self) -> int:
         """
-        Number of GPUs that share the same VRAM size as the best GPU.
-        Used for tensor-parallel sharding estimates.
-        On heterogeneous nodes (rare) only the matching GPUs are counted.
+        Number of GPU units (full GPUs or MIG slices) that share the same VRAM
+        as the best unit.  Used for within-node tensor-parallel sharding.
+
+        NOTE: MIG slices are hardware-isolated; you cannot shard a single model
+        across MIG slices on one physical GPU.  When MIG is active, this returns
+        the slice count for display purposes, but the caller should treat
+        within-node sharding capacity as 1 unit (one slice per job).
         """
         if not self.gpus:
             return 0
@@ -88,6 +100,9 @@ class HardwareInfo:
             return "CPU"
         if self.has_unified_memory:
             return "Apple MPS (Unified Memory)"
+        if self.has_mig:
+            names = ", ".join(g.name for g in self.gpus)
+            return f"CUDA/MIG ({names})"
         names = ", ".join(g.name for g in self.gpus)
         return f"CUDA ({names})"
 
@@ -99,6 +114,11 @@ class HardwareInfo:
         if self.gpus:
             for g in self.gpus:
                 lines.append(f"GPU  : {g}")
+            if self.has_mig:
+                lines.append(
+                    "MIG  : Active — slices are hardware-isolated; "
+                    "cross-node tensor-parallel is still available"
+                )
         else:
             lines.append("GPU  : None detected — inference will use CPU")
         lines.append(f"Device : {self.inference_device}")
@@ -151,7 +171,63 @@ def _parse_mem_string(s: str) -> Optional[int]:
 # NVIDIA
 # ---------------------------------------------------------------------------
 
+def _detect_nvidia_mig() -> List[GPUInfo]:
+    """
+    Detect NVIDIA MIG instances visible to the current process.
+
+    Returns a list of GPUInfo entries (one per MIG slice) only when MIG mode
+    is active on at least one GPU.  Returns an empty list otherwise so the
+    caller falls back to whole-GPU detection.
+
+    Each reported MIG slice carries ``is_mig_slice=True`` so downstream code
+    knows that within-node cross-slice sharding is NOT possible (slices are
+    hardware-isolated) — only cross-node tensor-parallel scaling applies.
+    """
+    # 1. Check whether any GPU in the node has MIG mode enabled.
+    mig_check = _run([
+        "nvidia-smi",
+        "--query-gpu=mig.mode.current",
+        "--format=csv,noheader",
+    ])
+    if not mig_check or "Enabled" not in mig_check:
+        return []
+
+    # 2. Enumerate all accessible MIG device instances.
+    #    --query-mig-device lists instances visible in the current CUDA context
+    #    (respects CUDA_VISIBLE_DEVICES / cgroups in a Slurm job).
+    mig_out = _run([
+        "nvidia-smi",
+        "--query-mig-device=index,name,memory.total",
+        "--format=csv,noheader,nounits",
+    ])
+    if not mig_out:
+        return []
+
+    gpus: List[GPUInfo] = []
+    for line in mig_out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3:
+            try:
+                # parts[0] = index, parts[1] = name, parts[2] = memory MB
+                gpus.append(
+                    GPUInfo(
+                        name=parts[1],
+                        vram_mb=int(parts[2]),
+                        is_mig_slice=True,
+                    )
+                )
+            except ValueError:
+                pass
+    return gpus
+
+
 def _detect_nvidia() -> List[GPUInfo]:
+    # MIG takes priority: if MIG instances are accessible, report those.
+    mig = _detect_nvidia_mig()
+    if mig:
+        return mig
+
+    # Standard whole-GPU detection.
     out = _run([
         "nvidia-smi",
         "--query-gpu=name,memory.total",

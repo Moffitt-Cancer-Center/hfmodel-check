@@ -21,7 +21,10 @@ For vLLM the mapping to parallelism flags is:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
+
+if TYPE_CHECKING:
+    from hf_wrapper.hardware import HardwareInfo
 
 from hf_wrapper.quantization import (
     best_quantization,
@@ -40,6 +43,11 @@ def _fmt_mb(mb: int) -> str:
     return f"{mb} MB"
 
 
+# Fine-grained steps for suggest_node_scaling so the minimum viable node count
+# is found exactly (pipeline-parallel does not require power-of-two).
+_NODE_COUNT_STEPS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64)
+
+# Power-of-two steps used for catalog comparison (coarser is fine there).
 _NODE_STEPS = (1, 2, 4, 8, 16)
 
 
@@ -156,7 +164,7 @@ def suggest_node_scaling(
         opts = suggest_node_scaling(70_000_000_000, H100_SXM_8GPU, max_nodes=4)
     """
     options: List[NodeScalingOption] = []
-    for n in _NODE_STEPS:
+    for n in _NODE_COUNT_STEPS:
         if n > max_nodes:
             break
         total_mb = n * node_spec.total_vram_mb
@@ -219,4 +227,43 @@ def node_spec_from_gpu(gpu_name: str, vram_mb: int, gpu_count: int = 1) -> NodeS
         gpu_model=gpu_name,
         gpu_count=gpu_count,
         vram_per_gpu_mb=vram_mb,
+    )
+
+
+def node_spec_from_hardware(hw: "HardwareInfo") -> Optional[NodeSpec]:
+    """
+    Build the best ``NodeSpec`` from detected hardware for scaling calculations.
+
+    Rules
+    -----
+    - No GPU detected → ``None`` (CPU-only; cross-node scaling not applicable)
+    - MIG active       → ``gpu_count=1``, ``vram_per_gpu_mb=slice_vram``
+      MIG slices are hardware-isolated.  A single job gets one slice; you
+      cannot shard a model *within* a node across slices.  Cross-node
+      tensor-parallel (one slice per node) is still valid and is modelled as
+      ``node_count > 1, gpu_count=1``.
+    - multi-GPU node   → ``gpu_count=homogeneous_gpu_count``, ``vram_per_gpu_mb=best_vram``
+    - single GPU node  → ``gpu_count=1``, ``vram_per_gpu_mb=gpu_vram``
+    """
+    if not hw.gpus:
+        return None
+
+    best_vram = hw.best_gpu_vram_mb
+    gpu_name = max(hw.gpus, key=lambda g: g.vram_mb).name
+
+    if hw.has_mig:
+        # One MIG slice per job — no within-node sharding.
+        return NodeSpec(
+            label="current-mig",
+            gpu_model=gpu_name,
+            gpu_count=1,
+            vram_per_gpu_mb=best_vram,
+        )
+
+    gpu_count = hw.homogeneous_gpu_count or 1
+    return NodeSpec(
+        label=f"current-{gpu_count}gpu",
+        gpu_model=gpu_name,
+        gpu_count=gpu_count,
+        vram_per_gpu_mb=best_vram,
     )
