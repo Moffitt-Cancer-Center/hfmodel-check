@@ -38,6 +38,14 @@ from hf_wrapper.quantization import (
     QuantOption,
     ShardingOption,
 )
+from hf_wrapper.cluster import (
+    NodeSpec,
+    NodeScalingOption,
+    KNOWN_NODE_CONFIGS,
+    suggest_node_scaling,
+    compare_with_catalog,
+    node_spec_from_gpu,
+)
 
 # Two consoles: status/warnings → stderr so stdout stays pipe-friendly
 err = Console(stderr=True)
@@ -105,12 +113,13 @@ def _status_cell(
     available_mb: int,
     per_gpu_vram_mb: int = 0,
     max_gpus: int = 1,
+    shard_unit: str = "GPU",
 ) -> tuple[str, str]:
     """Return (status_text, rich_style) for a model's fit status.
 
-    When *max_gpus* > 1 and the model doesn't fit in a single GPU, the cell
-    will show the minimum GPU count required for sharding rather than a plain
-    red "too large" label.
+    *shard_unit* controls the label for multi-unit sharding:
+      "GPU"  — within-node GPU sharding
+      "node" — cross-node sharding (caller passes total-GPU budget via max_gpus)
     """
     if mem.native_vram_mb is None or mem.param_count is None:
         return "? unknown size", "dim"
@@ -126,18 +135,18 @@ def _status_cell(
             label = best.level.key.upper()
             return f"~ {label} ({_fmt_mb(best.estimated_vram_mb)})", "yellow"
 
-    # Doesn't fit on a single GPU even with quantization.
-    # If we have multi-GPU info, try sharding.
+    # Doesn't fit on a single unit even with quantization — try sharding.
     if max_gpus > 1 and per_gpu_vram_mb > 0:
         shard_opts = suggest_sharding(param_count, per_gpu_vram_mb, max_gpus=max_gpus)
         for opt in shard_opts:
             if opt.gpu_count == 1:
                 continue  # already checked above
+            unit_label = f"{opt.gpu_count}× {shard_unit}"
             if opt.native_fits:
-                return f"↕ {opt.gpu_count}× GPU (native)", "cyan"
+                return f"↕ {unit_label} (native)", "cyan"
             if opt.best_quant:
                 tag = opt.best_quant.level.key.upper()
-                return f"↕ {opt.gpu_count}× GPU (~{tag})", "bright_cyan"
+                return f"↕ {unit_label} (~{tag})", "bright_cyan"
 
     return f"✗ too large ({_fmt_mb(mem.native_vram_mb)})", "red"
 
@@ -232,8 +241,19 @@ def _complete_tag(ctx, param, incomplete):
     type=int,
     metavar="N",
     help=(
-        "Maximum number of GPUs per node to consider for sharding "
+        "GPUs per node to consider for within-node sharding "
         "(default: detected GPU count, min 1)."
+    ),
+)
+@click.option(
+    "--nodes",
+    default=None,
+    type=int,
+    metavar="N",
+    help=(
+        "Number of identical nodes available from the queue for cross-node "
+        "tensor-parallel sharding (e.g. --nodes 4 on a single-GPU-per-node "
+        "cluster means a 4-GPU budget spread across 4 nodes)."
     ),
 )
 def cmd_search(
@@ -244,12 +264,16 @@ def cmd_search(
     tags: tuple,
     download_index: Optional[int],
     gpus: Optional[int],
+    nodes: Optional[int],
 ) -> None:
     """
     Search HuggingFace Hub for QUERY, showing only models compatible with
     your hardware.  Models that need quantization to fit are marked with the
     recommended quant level.  Models that require sharding across multiple
-    GPUs are shown with cyan ↕ markers.
+    GPUs or nodes are shown with cyan ↕ markers.
+
+    Use --nodes N to model cross-node tensor-parallel budgets (useful on
+    single-GPU-per-node HPC clusters where N jobs share one model).
 
     After results are shown you will be prompted to download a model by
     entering its result number.  Pass --download N to skip the prompt.
@@ -259,12 +283,31 @@ def cmd_search(
     hw = get_hw()
     available_mb = hw.effective_memory_mb
     per_gpu_vram_mb = hw.best_gpu_vram_mb
-    max_gpus = gpus if gpus is not None else hw.homogeneous_gpu_count
-    max_gpus = max(max_gpus, 1)
+    gpus_per_node = gpus if gpus is not None else hw.homogeneous_gpu_count
+    gpus_per_node = max(gpus_per_node, 1)
+    node_count = nodes if nodes is not None else 1
+    node_count = max(node_count, 1)
 
-    gpu_note = ""
-    if max_gpus > 1:
+    # Total GPU budget: gpus_per_node × node_count
+    max_gpus = gpus_per_node * node_count
+
+    # Label sharding units appropriately
+    # — cross-node, single-GPU-per-node → say "node"
+    # — within-node or multi-GPU-per-node → say "GPU"
+    shard_unit = "node" if (node_count > 1 and gpus_per_node == 1) else "GPU"
+
+    # Header note
+    if node_count > 1:
+        node_budget_mb = node_count * gpus_per_node * per_gpu_vram_mb
+        gpu_note = (
+            f"  [dim]({node_count}× nodes, "
+            f"{_fmt_mb(per_gpu_vram_mb)}/node = "
+            f"[bold]{_fmt_mb(node_budget_mb)}[/bold] tensor-parallel budget)[/dim]"
+        )
+    elif max_gpus > 1:
         gpu_note = f"  [dim]({max_gpus}× GPU sharding on)[/dim]"
+    else:
+        gpu_note = ""
 
     err.print(f"\n[bold cyan]Hardware[/bold cyan]: {hw.inference_device}  "
               f"([bold]{_fmt_mb(available_mb)}[/bold] available){gpu_note}")
@@ -341,6 +384,7 @@ def cmd_search(
             mem, available_mb,
             per_gpu_vram_mb=per_gpu_vram_mb,
             max_gpus=max_gpus,
+            shard_unit=shard_unit,
         )
 
         downloads = getattr(info, "downloads", None)
@@ -363,14 +407,15 @@ def cmd_search(
         return
 
     out.print(table)
+    shard_desc = f"{max_gpus}× {shard_unit}" if max_gpus > 1 else "1× GPU"
     legend_parts = [
         "Green = fits natively",
         "Yellow = fits with quantization",
-        "Cyan ↕ = requires multi-GPU sharding",
+        f"Cyan ↕ = requires sharding ({shard_desc} budget)",
         "Red = too large",
     ]
     out.print(
-        f"\n[dim]Showed {len(shown_models)}/{len(models)} models. "
+        f"\n[dim]Showed {len(shown_models)}/{len(models)} models.  "
         + "  ".join(legend_parts)
         + "[/dim]"
     )
@@ -378,8 +423,8 @@ def cmd_search(
         hidden = len(models) - len(shown_models)
         if hidden:
             out.print(
-                f"[dim]{hidden} model(s) hidden (too large even for {max_gpus}× GPU). "
-                f"Use --show-all to see them.[/dim]"
+                f"[dim]{hidden} model(s) hidden (too large even with {shard_desc}). "
+                f"Use --show-all to see them, or --nodes / --gpus to increase budget.[/dim]"
             )
 
     # ------------------------------------------------------------------
@@ -626,6 +671,199 @@ def _print_sharding_table(
     err.print(table)
 
 
+def _print_node_scaling_table(
+    options: List[NodeScalingOption],
+    heading: str = "Cross-node scaling",
+) -> None:
+    """Print a per-node-count scaling table for the current hardware type."""
+    out.print(f"\n[bold cyan]{heading}[/bold cyan]")
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        padding=(0, 1),
+    )
+    table.add_column("Nodes", justify="center", min_width=6)
+    table.add_column("GPUs/node", justify="center", min_width=10)
+    table.add_column("Total VRAM", justify="right", min_width=11)
+    table.add_column("Fits natively?", justify="center", min_width=14)
+    table.add_column("Best option", min_width=30)
+    table.add_column("vLLM flags", style="dim", min_width=30)
+
+    for opt in options:
+        if opt.native_fits:
+            fits_cell = Text("✓ yes", style="green")
+            best_cell = Text("BF16 / FP16 (native)", style="green")
+        elif opt.best_quant:
+            fits_cell = Text("~ quant", style="yellow")
+            label = opt.best_quant.level.display
+            vram = _fmt_mb(opt.best_quant.estimated_vram_mb)
+            best_cell = Text(f"{label}  (~{vram})", style=opt.best_quant.quality_color)
+        else:
+            fits_cell = Text("✗ no", style="red")
+            best_cell = Text("too large even at Q2", style="dim")
+
+        table.add_row(
+            Text(str(opt.node_count), style="cyan"),
+            str(opt.node_spec.gpu_count),
+            _fmt_mb(opt.total_vram_mb),
+            fits_cell,
+            best_cell,
+            opt.tp_pp_flags,
+        )
+    out.print(table)
+
+
+def _print_catalog_comparison_table(
+    options: List[NodeScalingOption],
+) -> None:
+    """Print a comparison table across different node types from the catalog."""
+    out.print("\n[bold cyan]Advanced node comparison[/bold cyan]  "
+              "[dim](min nodes needed from catalog)[/dim]")
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        padding=(0, 1),
+    )
+    table.add_column("Node type", min_width=28)
+    table.add_column("GPUs/node", justify="center", min_width=10)
+    table.add_column("Nodes needed", justify="center", min_width=13)
+    table.add_column("Total VRAM", justify="right", min_width=11)
+    table.add_column("Best option", min_width=28)
+    table.add_column("vLLM flags", style="dim", min_width=30)
+
+    for opt in options:
+        if opt.native_fits:
+            best_cell = Text("Native BF16/FP16", style="green")
+            nodes_cell = Text(str(opt.node_count), style="green")
+        elif opt.best_quant:
+            label = opt.best_quant.level.display
+            vram = _fmt_mb(opt.best_quant.estimated_vram_mb)
+            best_cell = Text(f"{label}  (~{vram})", style=opt.best_quant.quality_color)
+            nodes_cell = Text(str(opt.node_count), style="yellow")
+        else:
+            best_cell = Text("too large even at Q2", style="dim")
+            nodes_cell = Text(f">{opt.node_count}", style="red")
+
+        table.add_row(
+            opt.node_spec.gpu_model,
+            str(opt.node_spec.gpu_count),
+            nodes_cell,
+            _fmt_mb(opt.total_vram_mb),
+            best_cell,
+            opt.tp_pp_flags,
+        )
+    out.print(table)
+
+
+# ---------------------------------------------------------------------------
+# `hf scale`
+# ---------------------------------------------------------------------------
+
+@click.command("scale")
+@click.argument("model_id")
+@click.option(
+    "--max-nodes",
+    default=16,
+    show_default=True,
+    type=int,
+    metavar="N",
+    help="Maximum same-cluster nodes to model in the scaling table.",
+)
+@click.option(
+    "--max-catalog-nodes",
+    default=4,
+    show_default=True,
+    type=int,
+    metavar="N",
+    help="Maximum nodes per catalog entry in the advanced comparison table.",
+)
+def cmd_scale(model_id: str, max_nodes: int, max_catalog_nodes: int) -> None:
+    """
+    Show a full scaling analysis for MODEL_ID.
+
+    \b
+    Displays two tables:
+      1. Current cluster  — how many nodes (of your detected hardware) are
+         needed to run this model via cross-node tensor/pipeline parallelism.
+      2. Advanced catalog — minimum nodes required on each well-known HPC
+         node type (H100, A100, MI300X, …) so you can compare migration cost.
+
+    \b
+    Example:
+      hfw scale meta-llama/Llama-3-70b
+      hfw scale meta-llama/Llama-3-405b --max-nodes 32 --max-catalog-nodes 8
+    """
+    hw = get_hw()
+
+    with err.status(f"Fetching model metadata for [bold]{model_id}[/bold]…"):
+        mem = get_model_memory_info(model_id)
+
+    if mem is None or mem.param_count is None:
+        err.print(
+            f"[yellow]Could not determine model size for [bold]{model_id}[/bold]. "
+            "Model metadata may be missing on the Hub.[/yellow]"
+        )
+        sys.exit(1)
+
+    native_mb = mem.native_vram_mb or 0
+    out.print(
+        f"\n[bold cyan]Model[/bold cyan]: [bold]{model_id}[/bold]\n"
+        f"  Parameters  : [bold]{mem.param_str}[/bold]\n"
+        f"  Native dtype: [bold]{mem.dtype}[/bold]\n"
+        f"  Native VRAM : [bold]{_fmt_mb(native_mb)}[/bold]  "
+        f"(with {int((1.20 - 1) * 100)}% overhead)\n"
+    )
+
+    # ── Current cluster scaling ────────────────────────────────────────────
+    if hw.gpus:
+        gpu_name = hw.gpus[0].name
+        per_gpu_mb = hw.best_gpu_vram_mb
+        gpus_per_node = hw.homogeneous_gpu_count
+        current_node = node_spec_from_gpu(gpu_name, per_gpu_mb, gpus_per_node)
+        node_opts = suggest_node_scaling(mem.param_count, current_node, max_nodes=max_nodes)
+        _print_node_scaling_table(
+            node_opts,
+            heading=f"Current cluster — {current_node}",
+        )
+
+        # Highlight the minimum viable config
+        viable = [o for o in node_opts if o.is_viable]
+        if viable:
+            min_opt = viable[0]
+            if min_opt.native_fits:
+                qual = "natively at native dtype"
+            else:
+                q = min_opt.best_quant
+                qual = f"with {q.level.display} quantization (~{_fmt_mb(q.estimated_vram_mb)})" if q else "with quantization"
+            out.print(
+                f"\n[bold]Minimum config[/bold]: "
+                f"[bold cyan]{min_opt.node_count}× node(s)[/bold cyan] "
+                f"([bold]{_fmt_mb(min_opt.total_vram_mb)}[/bold] total) — "
+                f"runs {qual}\n"
+                f"[dim]  vllm serve {model_id} {min_opt.tp_pp_flags}[/dim]"
+            )
+        else:
+            out.print(
+                f"\n[bold red]Cannot fit on up to {max_nodes}× nodes of this "
+                f"hardware even with Q2 quantization.[/bold red]\n"
+                "[dim]Try --max-nodes to extend the search, or see catalog below.[/dim]"
+            )
+    else:
+        out.print("[yellow]No GPU detected — skipping cluster scaling table.[/yellow]")
+
+    # ── Advanced catalog comparison ────────────────────────────────────────
+    catalog_opts = compare_with_catalog(
+        mem.param_count,
+        max_nodes=max_catalog_nodes,
+    )
+    _print_catalog_comparison_table(catalog_opts)
+    out.print(
+        f"\n[dim]Catalog shows minimum nodes needed (up to {max_catalog_nodes}×) "
+        "for each node type to run this model natively or with best-fit quantization.\n"
+        "Use [bold]hfw scale <model> --max-catalog-nodes 8[/bold] to extend the window.[/dim]\n"
+    )
+
+
 def _confirm_proceed() -> bool:
     """Ask user if they want to download anyway. Returns True to proceed."""
     try:
@@ -671,6 +909,7 @@ def cli(ctx: click.Context) -> None:
     New commands (hardware-aware):
       hardware    Show detected GPU/VRAM and available memory
       search      Search models filtered to what fits your hardware
+      scale       Full scaling analysis: current cluster + advanced node catalog
       completion  Print shell tab-completion setup instructions
 
     Enhanced commands:
@@ -746,6 +985,7 @@ def cmd_completion(shell: Optional[str]) -> None:
 cli.add_command(cmd_hardware)
 cli.add_command(cmd_search)
 cli.add_command(cmd_download)
+cli.add_command(cmd_scale)
 cli.add_command(cmd_completion)
 
 
